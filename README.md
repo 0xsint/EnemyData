@@ -105,6 +105,11 @@ In `%APPDATA%\Arrowhead\Helldivers2\`, written with defaults on first
 run. Saved edits apply within 3 seconds; no restart. The desktop app never
 touches this file (it writes the mission plan, `EnemyIntel.ini`).
 
+**The F9 menu** (Chef's options menu, under Enemy Intel) has the layout, ping
+targeting, unidentified-enemy and camera settings, so you can change them in
+game. The menu and this file stay in step: a change in either one is written
+to the other. Key bindings, hash names and ignores are only in this file.
+
 ```
 ping=keyboard:q            # your ping input; ping=mouse:middle etc. One line each.
 panel_key=f4

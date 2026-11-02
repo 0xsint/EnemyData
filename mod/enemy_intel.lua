@@ -156,7 +156,10 @@ local S = {
 -- chef.own_log (called first at startup) sends these lines to EnemyIntel.log. Until then, and if the name
 -- is refused, they go to chef_loader.log.
 local LOG = { errors = 0 }
-local log = chef.log
+-- chef.own_log changes where chef.log writes, so look chef.log up on each call rather than caching it.
+local function log(text)
+  chef.log(text)
+end
 
 -- The mod's files that the EnemyData app and you edit: plan, settings, probe. Chef reads and writes
 -- them only in its log folder.
@@ -420,6 +423,8 @@ local function settings_template()
   end
   return table.concat({
     "# Enemy Intel settings. Saved changes apply within a few seconds; no restart needed.",
+    "# The F9 menu has the layout, ping targeting, unidentified and camera settings; either one changes them.",
+    "# Keys, hash names and ignores are set only here.",
     "#",
     "# The key or mouse button you ping with in the game. One line each; add lines for more.",
     "#   ping=keyboard:q    ping=mouse:middle    (mouse buttons: left right middle extra_1 extra_2)",
@@ -544,6 +549,78 @@ local function apply_user_settings(body)
   return problems
 end
 
+-- Settings that also show in Chef's F9 menu: { name, label }. Sliders take their range from
+-- NUMBER_SETTINGS, the others are on/off. The menu and EnemyIntelSettings.ini stay in step: a change in
+-- either is written to the other. Keys, hash names and ignores are file-only.
+local MENU_ROWS = {
+  { "panel_x", "Panel: left to right (0 = left, 1 = right)" },
+  { "panel_y", "Panel: bottom to top (0 = bottom, 1 = top)" },
+  { "card_x", "Ping card: left to right" },
+  { "card_y", "Ping card: bottom to top" },
+  { "font_size", "Font size" },
+  { "rows", "Enemy rows in the panel" },
+  { "unidentified_rows", "Unidentified rows in the panel" },
+  { "show_unidentified", "Show unidentified enemies" },
+  { "ping_cone", "Ping cone: degrees off your aim" },
+  { "ping_range", "Ping range: metres" },
+  { "ping_seconds", "Ping card: seconds on screen" },
+  { "camera_aim", "Aim pings with the game camera" },
+}
+
+-- The table and field a setting lives in: CFG.hud.font_size, CFG.rows, CFG.camera_aim and so on.
+local function setting_field(name)
+  local number = NUMBER_SETTINGS[name]
+  if number then
+    return number[1] and CFG[number[1]] or CFG, number[2]
+  end
+  return CFG, name
+end
+
+local function setting_text(value)
+  if type(value) == "boolean" then
+    return tostring(value)
+  end
+  return string.format("%g", value)
+end
+
+-- Writes name=value into EnemyIntelSettings.ini, changing only that line (or adding it at the end), so
+-- the comments, key bindings, hash names and ignores stay as they are.
+local function write_setting(name, value)
+  local path = data_path(CFG.user_settings_file)
+  local handle = io.open(path, "r")
+  local text = handle and handle:read("*a") or settings_template()
+  if handle then
+    handle:close()
+  end
+  local line = name .. "=" .. setting_text(value)
+  local body, count = ("\n" .. text):gsub("\n" .. name .. "%s*=[^\n]*", "\n" .. line)
+  if count == 0 then
+    body = body .. "\n" .. line .. "\n"
+  end
+  local out = io.open(path, "w")
+  if out then
+    pcall(out.write, out, body:sub(2))
+    pcall(out.close, out)
+  end
+end
+
+-- F9 menu rows (Chef) mirror CFG. False until the rows are registered at startup.
+local MENU = { ready = false }
+
+-- Brings every menu row to the value CFG holds: after the settings file changed, or at startup. A row
+-- whose value already matches does nothing, so the change handler does not write the file back.
+local function sync_menu()
+  if not MENU.ready then
+    return
+  end
+  for _, row in ipairs(MENU_ROWS) do
+    local target, field = setting_field(row[1])
+    if chef.get(row[1]) ~= target[field] then
+      chef.set(row[1], target[field])
+    end
+  end
+end
+
 local function load_user_settings()
   local path = data_path(CFG.user_settings_file)
   local handle = io.open(path, "r")
@@ -580,6 +657,7 @@ local function load_user_settings()
   for _, problem in ipairs(problems) do
     log("settings: ignored line: " .. problem)
   end
+  sync_menu()
 end
 
 --------------------------------------------------------------------------------------- camera aim
@@ -1609,6 +1687,15 @@ local function hud_drop()
   HUD.ids, HUD.cache = {}, {}
 end
 
+-- Removes every line drawn so far, so the next draw creates them again (a new font size needs that).
+local function hud_clear(target_gui)
+  local destroy = engine_fn("Gui", "destroy_text")
+  for _, pair in pairs(HUD.ids) do
+    hud_destroy_pair(target_gui, pair, destroy)
+  end
+  HUD.ids, HUD.cache = {}, {}
+end
+
 local function hud_world_is_live(world)
   local worlds_fn = engine_fn("Application", "worlds")
   if not worlds_fn or world == nil then
@@ -1710,6 +1797,10 @@ local function hud_draw()
     return
   end
 
+  if HUD.font_size ~= CFG.hud.font_size then
+    hud_clear(target_gui)
+    HUD.font_size = CFG.hud.font_size
+  end
   local set_visible = engine_fn("Gui", "set_visible")
   if set_visible then
     pcall(set_visible, target_gui, true)
@@ -1939,6 +2030,41 @@ local function update(dt)
   end
 end
 
+-- Registers the F9 rows (Chef API 2, chef.has('menu')). A row's change runs its handler below: CFG takes the
+-- new value and the settings file gets it. The file's values win at startup; sync_menu sets the rows to them.
+local function register_menu()
+  if not (chef.has and chef.has("menu")) then
+    log("menu: this Chef Shared Loader has no F9 menu; set these in EnemyIntelSettings.ini")
+    return
+  end
+  chef.title("Enemy Intel")
+  for _, row in ipairs(MENU_ROWS) do
+    local name, label = row[1], row[2]
+    local target, field = setting_field(name)
+    local number = NUMBER_SETTINGS[name]
+    if number then
+      chef.option(name, { type = "slider", label = label, default = target[field],
+        min = number[3], max = number[4], step = number[5] and 1 or 0.01 })
+    else
+      chef.option(name, { type = "toggle", label = label, default = target[field] })
+    end
+    chef.on_change(name, function(value)
+      if number and number[5] then
+        value = math.floor(value + 0.5)
+      end
+      local current, key = setting_field(name)
+      if current[key] == value then
+        return
+      end
+      current[key] = value
+      write_setting(name, value)
+      HUD.next_refresh = 0
+    end)
+  end
+  MENU.ready = true
+  sync_menu()
+end
+
 -------------------------------------------------------------------------------------------- startup
 
 chef.own_log(CFG.log_name)
@@ -1948,6 +2074,7 @@ load_plan()
 load_probe_state()
 build_groups()
 build_keys()
+register_menu()
 S.names_dirty, S.keys_dirty = false, false
 
 do

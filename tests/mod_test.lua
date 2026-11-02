@@ -189,9 +189,10 @@ local function make_io(files)
 end
 
 -- Loads the mod the way Chef does: the chunk gets Chef's helper table as its argument, and the hooks it
--- returns are what the loader calls. Records every global it writes (there should be none).
-local function load_mod(world)
-  local log_lines, written = {}, {}
+-- returns are what the loader calls. Records every global it writes (there should be none). The fake
+-- F9 menu keeps rows and values; chef.set changes a row and runs its handlers, as the menu does.
+local function load_mod(world, no_menu)
+  local log_lines, loader_lines, written = {}, {}, {}
   local env = {}
   env._G = env
   rawset(env, "stingray", make_engine(world))
@@ -202,17 +203,49 @@ local function load_mod(world)
     __newindex = function(_, key, value) written[key] = true; rawset(env, key, value) end,
   })
   local chef = { log_directory = LOG_DIR, log_file = LOG_DIR .. "\\chef_loader.log" }
+  local menu = { rows = {}, values = {}, handlers = {}, title = nil }
+  -- As Chef does it: before own_log, chef.log writes to chef_loader.log; after it, to the mod's own file.
+  function chef.log(text)
+    loader_lines[#loader_lines + 1] = text
+  end
   function chef.own_log(name)
+    chef.log = function(text)
+      log_lines[#log_lines + 1] = text
+    end
     chef.log_file = LOG_DIR .. "\\" .. name .. ".log"
     return true
   end
-  function chef.log(text)
-    log_lines[#log_lines + 1] = text
+  function chef.has(name)
+    return name == "menu" and not no_menu
+  end
+  function chef.title(text)
+    menu.title = text
+  end
+  function chef.option(id, spec)
+    menu.rows[id] = spec
+    if menu.values[id] == nil then
+      menu.values[id] = spec.default
+    end
+    return menu.values[id]
+  end
+  function chef.get(id)
+    return menu.values[id]
+  end
+  function chef.set(id, value)
+    menu.values[id] = value
+    for _, handler in ipairs(menu.handlers[id] or {}) do
+      handler(value)
+    end
+  end
+  function chef.on_change(id, handler)
+    menu.handlers[id] = menu.handlers[id] or {}
+    table.insert(menu.handlers[id], handler)
   end
   local chunk = assert(loadstring(SOURCE, "@enemy_intel.lua"))
   setfenv(chunk, env)
   local hooks = chunk(chef)
-  return { env = env, log = log_lines, written = written, world = world, update = hooks and hooks.update }
+  return { env = env, log = log_lines, loader = loader_lines, written = written, world = world,
+    update = hooks and hooks.update, menu = menu, chef = chef }
 end
 
 local function run(mod, seconds, dt)
@@ -739,6 +772,58 @@ do
   check(grep(mod, "ignored line: nonsense line") ~= nil, "settings: bad line not reported")
 end
 
+-- F9 menu (Chef): the rows and the settings file agree in both directions, and a font change redraws.
+do
+  local world = new_world()
+  add_units(world, 1, PLAYER)
+  add_units(world, 25, HASH["Trooper"], 40, 0)
+  local mod = load_mod(world)
+  run(mod, 12)
+  local menu = mod.menu
+  check(menu.title == "Enemy Intel", "menu: title missing")
+  check(menu.rows.panel_y and menu.rows.panel_y.type == "slider" and menu.rows.panel_y.max == 1, "menu: panel_y slider missing")
+  check(menu.rows.font_size and menu.rows.font_size.step == 1 and menu.rows.font_size.max == 60, "menu: font_size range wrong")
+  check(menu.rows.camera_aim and menu.rows.camera_aim.type == "toggle", "menu: camera_aim toggle missing")
+  check(menu.rows.panel_key == nil and menu.rows.ping_key == nil, "menu: key bindings should stay in the file")
+  check(menu.values.panel_y == 0.78, "menu: panel_y not at the file's value")
+
+  -- Menu -> file, and the panel moves.
+  mod.chef.set("panel_y", 0.5)
+  run(mod, 0.6)
+  check(has(world.files[SETTINGS_PATH], "panel_y=0.5\n"), "menu: change not written to the file")
+  check(has(world.files[SETTINGS_PATH], "ping=keyboard:q\n"), "menu: an unrelated line was changed")
+  local title = screen(world)[1]
+  check(title and title.y == 720, "menu: panel did not move: " .. tostring(title and title.y))
+
+  -- File -> menu: an edit to the file reaches the row within a few seconds.
+  world.files[SETTINGS_PATH] = world.files[SETTINGS_PATH]:gsub("rows=8", "rows=3")
+  run(mod, 3.5)
+  check(menu.values.rows == 3, "menu: file edit did not reach the menu row")
+
+  -- A font size change redraws every line at the new size.
+  mod.chef.set("font_size", 30)
+  run(mod, 0.6)
+  check(has(world.files[SETTINGS_PATH], "font_size=30\n"), "menu: font size not written")
+  local sizes = {}
+  for _, t in ipairs(screen(world)) do sizes[t.size] = true end
+  check(sizes[30] and not sizes[22], "menu: font size change not redrawn")
+
+  -- A toggle through the menu.
+  mod.chef.set("show_unidentified", false)
+  run(mod, 0.2)
+  check(has(world.files[SETTINGS_PATH], "show_unidentified=false\n"), "menu: toggle not written")
+end
+
+-- No F9 menu in this Chef build: nothing is registered, the log says where to set the values.
+do
+  local world = new_world()
+  add_units(world, 1, PLAYER)
+  local mod = load_mod(world, true)
+  check(run(mod, 12), "no menu: update errored")
+  check(next(mod.menu.rows) == nil, "no menu: rows registered anyway")
+  check(grep(mod, "has no F9 menu") ~= nil, "no menu: not logged")
+end
+
 -- Unidentified enemies: hashes in no table get rows and counts once they move; scenery (never moves)
 -- and anything seen on the ship stay off. Ping one to see its hash, then name it in the settings file.
 do
@@ -920,6 +1005,8 @@ do
   local mod = load_mod(world)
   check(type(mod.update) == "function", "hooks: no update hook returned")
   check(next(mod.written) == nil, "hooks: a global was written")
+  check(grep(mod, "start: enemy-intel") ~= nil, "hooks: start line not in the mod's own log")
+  check(#mod.loader == 0, "hooks: mod lines went to chef_loader.log after own_log: " .. tostring(mod.loader[1]))
   check(run(mod, 1), "hooks: update errored")
 end
 
